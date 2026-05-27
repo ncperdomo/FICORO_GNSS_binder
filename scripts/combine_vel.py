@@ -1,0 +1,335 @@
+""" This code combines GNSS velocity fields into a single velocity field. 
+The input folder should contain a set of .vel files, previously cleaned 
+using the lognorm_filter and coherence_filter scripts. The output folder 
+will contain a single .csv file with the combined velocity field for each 
+reference frame. The code also outputs CSV files with the velocities 
+considered in the combination for each station and a file with the number 
+of solutions per GNSS station."""
+
+""" Import necessary modules """
+import os
+import sys
+from unittest import result
+import pandas as pd
+from itertools import product
+import numpy as np
+from math import sin, cos, sqrt, atan2, radians
+import time
+import warnings
+
+# Ignore future warnings (I will fix these in a future release)
+warnings.simplefilter(action='ignore', category=FutureWarning) 
+
+""" Implement a version of the Union-Find (also known as Disjoint Set) data 
+structure. The purpose of these functions is to track and merge groups of
+nearby GNSS stations""" 
+
+def find(parent, i):
+    if parent[i] == i:
+        return i
+    return find(parent, parent[i])
+
+def union(parent, rank, x, y):
+    xroot = find(parent, x)
+    yroot = find(parent, y)
+    if rank[xroot] < rank[yroot]:
+        parent[xroot] = yroot
+    elif rank[xroot] > rank[yroot]:
+        parent[yroot] = xroot
+    else:
+        parent[yroot] = xroot
+        rank[xroot] += 1
+
+# Modified version of make_groups function to include unconnected stations
+
+def make_groups(indices):
+    """ make_groups is a function that uses the above Union-Find implementation 
+    to group GNSS stations based on their proximity. It takes a list of indices
+    as input and returns a list of groups of indices. Each group contains the 
+    indices of stations that are close to each other."""
+
+    parent = {}
+    rank = {}
+
+    for i, j in indices:
+        if i not in parent:
+            parent[i] = i
+            rank[i] = 0
+        if j not in parent:
+            parent[j] = j
+            rank[j] = 0
+        union(parent, rank, i, j)
+
+    groups = {}
+    for i in parent:
+        root = find(parent, i)
+        if root not in groups:
+            groups[root] = []
+        groups[root].append(i)
+
+    # Extract all unique indices from indices list
+    all_indices = set(i for i, _ in indices) | set(j for _, j in indices)
+    
+    # Add stations that are not close to any other station.
+    for idx in all_indices:
+        if idx not in parent:
+            groups[idx] = [idx]
+
+    return list(groups.values())
+
+def calculate_distance(lat1, lon1, lat2, lon2):
+    """ The calculate_distance function computes the Haversine distance between two sets 
+    of latitude and longitude values, returning the result in kilometers."""
+
+    # Calculate the distance between two coordinates in kilometers
+    R = 6371.0  # approximate radius of Earth in km
+    dlon = radians(lon2) - radians(lon1)
+    dlat = radians(lat2) - radians(lat1)
+    a = sin(dlat / 2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    distance = R * c
+    return distance
+
+def remove_outliers(data, east_col='E.vel', north_col='N.vel', up_col='U.vel'):
+    """ The remove_outliers function removes outliers from the dataset based on the 
+    magnitude and azimuthal direction of the velocity vectors. It takes a DataFrame 
+    as input and returns the data without outliers and the outliers. The function
+    implements the Interquartile Range (IQR) method to detect outliers."""
+
+    # Calculate the magnitude of the velocity vectors
+    magnitudes = np.sqrt(data[east_col] ** 2 + data[north_col] ** 2)
+
+    # Calculate the azimuthal direction (in radians) of the velocity vectors
+    azimuths = np.arctan2(data[north_col], data[east_col])
+
+    # Calculate the median magnitude and median azimuth
+    median_magnitude = np.median(magnitudes)
+    median_azimuth = np.median(azimuths)
+
+    # Calculate the magnitude and azimuthal differences from the median
+    magnitude_diffs = np.abs(magnitudes - median_magnitude)
+    azimuth_diffs = np.abs(np.arctan2(np.sin(azimuths - median_azimuth), np.cos(azimuths - median_azimuth)))
+
+    # Compute the Interquartile Range (IQR) for both magnitude and azimuthal differences
+    Q1_magnitude = np.percentile(magnitude_diffs, 25)
+    Q3_magnitude = np.percentile(magnitude_diffs, 75)
+    iqr_magnitude = Q3_magnitude - Q1_magnitude
+
+    Q1_azimuth = np.percentile(azimuth_diffs, 25)
+    Q3_azimuth = np.percentile(azimuth_diffs, 75)
+    iqr_azimuth = Q3_azimuth - Q1_azimuth
+
+    # Define the thresholds for outlier detection
+    lower_magnitude_threshold = Q1_magnitude - 1.5 * iqr_magnitude
+    upper_magnitude_threshold = Q3_magnitude + 1.5 * iqr_magnitude
+
+    lower_azimuth_threshold = Q1_azimuth - 1.5 * iqr_azimuth
+    upper_azimuth_threshold = Q3_azimuth + 1.5 * iqr_azimuth
+
+    # Find the indices of stations with magnitude or azimuthal differences exceeding the thresholds
+    outlier_indices = data.index[
+        (magnitude_diffs < lower_magnitude_threshold) |
+        (magnitude_diffs > upper_magnitude_threshold) |
+        (azimuth_diffs < lower_azimuth_threshold) |
+        (azimuth_diffs > upper_azimuth_threshold)
+    ]
+
+    # Check if all data points are outliers
+    if len(outlier_indices) == len(data):
+        # Compute horizontal and vertical median velocities separately. 
+        # Return the median East and North velocity components as there are no valid data points left
+        median_velocities = data[[east_col, north_col]].median()
+        # For the vertical component, consider only non-zero values in the median calculation
+        median_velocities[up_col] = data[data[up_col] != 0][up_col].median()
+        # If all values are zero, return 0.00 as the median (later, the code will detect zero values and assign NaN)
+        if data[data[up_col] != 0][up_col].empty:
+            print("Warning: All vertical velocities are zero. Assigning 0.00 as the median.")
+            median_velocities[up_col] = round(0.00,2)
+        return median_velocities, pd.DataFrame()
+
+    # Remove the outliers from the dataset to get the data without outliers
+    data_without_outliers = data.drop(outlier_indices)
+    outliers = data.loc[outlier_indices]
+
+    # Return the data without outliers and the outliers
+    return data_without_outliers, outliers
+
+def create_distance_dict(stations, threshold=1.11):
+    """ Instead of creating a separation matrix for station distances, a dictionary 
+    approach is used to efficiently map stations within a certain distance of each other.
+    This approach reduces the time complexity of the algorithm from O(n^2) to O(n)."""
+    distance_dict = {}
+    for i, j in product(range(len(stations)), repeat=2):
+        distance = calculate_distance(stations[i][1], stations[i][0], stations[j][1], stations[j][0])
+        if distance < threshold:
+            if i not in distance_dict:
+                distance_dict[i] = set()
+            distance_dict[i].add(j)
+    return distance_dict
+
+def combine_velocities(input_folder, combined_folder):
+    """ The combine_velocities function takes an input folder path containing previously 
+    filtered .vel files and an output folder path, where the combined velocity field in 
+    different reference frames will be saved. The combination is done by:
+    - Reading multiple .vel files and merging their data.
+    - Creating a distance dictionary that maps station pairs based on their proximity.
+    - Using the distance dictionary, it groups close stations together.
+    For each group of close stations, it:
+        - Removes outliers from the group based on magnitude and azimuthal direction differences.
+        - Computes the median of the velocities and uncertainties for each component.
+        - Updates the velocity and other fields for the group based on the first station in the group.
+        - Records statistics for the group (number of solutions per station)
+    - After processing all groups, it saves the combined velocity field as a .csv file"""
+
+    # Create the output folders if they don't exist
+    os.makedirs(combined_folder, exist_ok=True)
+
+    # Read all .vel files and merge them into a single velocity field
+    file_paths = [f for f in os.listdir(input_folder) if f.endswith('.vel')]
+    dfs = []
+    for file_path in file_paths:
+        basename = os.path.splitext(os.path.basename(file_path))[0]
+        if basename.endswith('igb14'):
+            df = pd.read_csv(os.path.join(input_folder, file_path), sep=r"\s+", header=None, skiprows=0)
+        else:
+            df = pd.read_csv(os.path.join(input_folder, file_path), sep=r"\s+", header=None, skiprows=4)
+        df.columns = ['Lon', 'Lat', 'E.vel', 'N.vel', 'E.adj', 'N.adj', 'E.sig', 'N.sig', 'Corr', 'U.vel', 'U.adj', 'U.sig', 'Stat']
+        df['Ref'] = basename
+        dfs.append(df)
+    combined_df = pd.concat(dfs, ignore_index=True)
+
+    # Get the coordinates of all stations in the combined velocity field
+    stations = combined_df[['Lon', 'Lat']].values
+
+    # Use the distance dictionary to find close station pairs
+    distance_dict = create_distance_dict(stations)
+    close_stations = [(i, j) for i, neighbours in distance_dict.items() for j in neighbours]
+
+    # Group close stations together
+    close_stations_groups = make_groups(close_stations)
+    print("Number of groups of close stations: {}".format(len(close_stations_groups)))
+
+    # Create statistics folder
+    statistics_folder = os.path.join(combined_folder, "statistics")
+    os.makedirs(statistics_folder, exist_ok=True)
+
+    # Initialise aggregated_df and statistics_df unconditionally to avoid NameError
+    aggregated_df = pd.DataFrame()
+    statistics_df = pd.DataFrame(columns=['Lon', 'Lat', 'Stat', 'Num'])
+
+    for group in close_stations_groups:
+        if len(group) > 1:
+            # Extract a copy to avoid SettingWithCopyWarning
+            group_df = combined_df.loc[group].copy()
+
+            # Save to aggregated_df for debugging if any row belongs to eura
+            if group_df['Ref'].iloc[0].endswith('eura'):
+                aggregated_df = pd.concat([aggregated_df, group_df], ignore_index=True)
+
+            # Step 1: Remove outliers
+            result, outliers = remove_outliers(group_df[['E.vel', 'N.vel', 'U.vel']])
+
+            if isinstance(result, pd.Series):
+                # All points were outliers — broadcast the single median to all rows
+                group_df[['E.vel', 'N.vel', 'U.vel']] = result.to_numpy()
+            else:
+                # Normal case — update only the surviving (non-outlier) rows
+                group_df.loc[result.index, ['E.vel', 'N.vel', 'U.vel']] = result.values
+
+            # Step 2: Compute median velocities on the updated group_df
+            median_velocities = group_df[['E.vel', 'N.vel']].median().round(2)
+            non_zero_u = group_df[group_df['U.vel'] != 0]['U.vel']
+            if non_zero_u.empty:
+                print("Warning: All vertical velocities are zero. Assigning NaN as the median.")
+                median_velocities['U.vel'] = np.nan
+            else:
+                median_velocities['U.vel'] = non_zero_u.median().round(2)
+
+            # Step 3: Compute median uncertainties
+            uncertainties = group_df[['E.sig', 'N.sig', 'U.sig']].median().round(2).astype('float')
+
+            # Pick the first station in the group
+            chosen_station = group_df.iloc[0]
+
+            # Update all rows in group_df with combined values
+            group_df[['E.vel', 'N.vel', 'U.vel']] = median_velocities.to_numpy()
+            group_df[['E.sig', 'N.sig', 'U.sig']] = uncertainties.to_numpy()
+            group_df['Lon'] = chosen_station['Lon'].round(5)
+            group_df['Lat'] = chosen_station['Lat'].round(5)
+            group_df['Stat'] = chosen_station['Stat']
+            group_df['E.adj'] = chosen_station['E.adj'].round(2)
+            group_df['N.adj'] = chosen_station['N.adj'].round(2)
+            group_df['U.adj'] = chosen_station['U.adj'].round(2)
+            group_df['Corr'] = chosen_station['Corr'].round(3)
+
+            # Record statistics for eura reference frame
+            if chosen_station['Ref'].endswith('eura'):
+                statistics_to_add = pd.DataFrame({
+                    'Lon': [chosen_station['Lon'].round(5)],
+                    'Lat': [chosen_station['Lat'].round(5)],
+                    'Stat': [chosen_station['Stat']],
+                    'Num': [len(group)]
+                })
+                statistics_df = pd.concat([statistics_df, statistics_to_add], ignore_index=True)
+
+            # Write the processed group back into combined_df
+            combined_df.loc[group] = group_df
+
+            # Debugging: check for unexpected NaN values
+            if combined_df.isnull().values.any():
+                print("Warning: NaN values found in the merged DataFrame.")
+                print(combined_df[combined_df.isnull().any(axis=1)])
+
+        else:
+            # Single station — use as is
+            chosen_station = combined_df.loc[group[0]]
+            combined_df.loc[group, 'Stat'] = chosen_station['Stat']
+
+            if chosen_station['Ref'].endswith('eura'):
+                statistics_to_add = pd.DataFrame({
+                    'Lon': [chosen_station['Lon'].round(5)],
+                    'Lat': [chosen_station['Lat'].round(5)],
+                    'Stat': [chosen_station['Stat']],
+                    'Num': [1]
+                })
+                statistics_df = pd.concat([statistics_df, statistics_to_add], ignore_index=True)
+
+    # Drop duplicates keeping first occurrence
+    combined_df.drop_duplicates(subset=['Lon', 'Lat'], keep='first', inplace=True)
+
+    # Drop the Ref column
+    combined_df.drop(columns=['Ref'], inplace=True)
+
+    # Determine output filename
+    if basename.endswith('igb14'):
+        output_filename = "combined_vel_igb14.csv"
+    else:
+        output_filename = "combined_vel_" + os.path.basename(input_folder)[-4:] + ".csv"
+
+    combined_df.to_csv(os.path.join(combined_folder, output_filename), sep=' ', index=False)
+
+    # Save debugging and statistics files if eura reference frame was processed
+    if not aggregated_df.empty:
+        aggregated_df.to_csv(os.path.join(statistics_folder, "grouped_stations.csv"), sep=',', index=False)
+
+    if not statistics_df.empty:
+        statistics_df.to_csv(os.path.join(statistics_folder, "site_statistics.csv"), sep=',', index=False)
+
+if __name__ == "__main__":
+    # Check if the correct number of command-line arguments is provided
+    if len(sys.argv) != 3:
+        print("Usage: python combine_vel.py ./path2/input_folder ./path2/output_folder")
+        sys.exit(1)
+
+    input_folder = sys.argv[1]
+    combined_folder = sys.argv[2] 
+
+    # Time the execution of the combine_velocities function
+    start_time = time.time()
+    combine_velocities(input_folder, combined_folder)
+    end_time = time.time()
+
+    # Calculate and print the elapsed time in minutes
+    elapsed_time = (end_time - start_time) / 60
+    print("Time taken to combine GNSS velocity fields: {:.2f} minutes".format(elapsed_time))
+    
